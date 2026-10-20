@@ -1,0 +1,1041 @@
+"""
+SportRadar Tennis Analytics — Streamlit App
+Run: streamlit run app/streamlit_app.py
+"""
+import json
+import os
+import sys
+
+# Ensure project root is on the path so sibling packages (database/, api/) are importable
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, PROJECT_ROOT)
+
+import altair as alt
+import pandas as pd
+import streamlit as st
+from database.connection import get_connection
+
+st.set_page_config(page_title="Tennis Rankings Explorer", page_icon="🎾", layout="wide")
+
+# Rankings accumulate week over week, so every ranking query is limited to the latest snapshot
+LATEST_SNAPSHOT = (
+    "(r.ranking_year, r.ranking_week) = (SELECT ranking_year, ranking_week FROM Competitor_Rankings "
+    "ORDER BY ranking_year DESC, ranking_week DESC LIMIT 1)"
+)
+LATEST_SNAPSHOT_BARE = LATEST_SNAPSHOT.replace("r.ranking", "ranking", 2)
+
+
+@st.cache_data(ttl=300)
+def run_query(sql: str, params: tuple = (), quiet: bool = False) -> pd.DataFrame:
+    """Cached, parameterized query runner. Never interpolate raw user input into sql."""
+    try:
+        conn = get_connection()
+        df = pd.read_sql(sql, conn, params=params)
+        conn.close()
+        return df
+    except Exception as e:
+        if not quiet:
+            st.error(f"Database error: {e}")
+        return pd.DataFrame()
+
+
+def show_df(df: pd.DataFrame, container=st, **kwargs):
+    """st.dataframe at full width on both old and new Streamlit versions."""
+    try:
+        container.dataframe(df, width="stretch", **kwargs)
+    except TypeError:
+        container.dataframe(df, use_container_width=True, **kwargs)
+
+
+def pct(part, whole) -> float:
+    return round(100 * part / whole, 1) if whole else 0.0
+
+
+def chart_purpose(what: str, why: str):
+    """Plain-language 'what / why' lines shown above every chart."""
+    st.markdown(f"{what}")
+    st.markdown(f"{why}")
+
+
+def show_altair(chart):
+    """Render an Altair chart at full width on both old and new Streamlit versions."""
+    try:
+        st.altair_chart(chart, width="stretch")
+    except TypeError:
+        st.altair_chart(chart, use_container_width=True)
+
+
+def bar(data, x_label: str, y_label: str, sort_desc: bool = True, horizontal: bool = False):
+    """
+    Bar chart with axis titles and an explicit order.
+    sort_desc=True  -> largest bar first (rankings, categories, countries)
+    sort_desc=False -> keep the data's own order (histogram bins must stay in numeric order)
+    horizontal=True -> category labels on the left, easier to read for long names
+    """
+    series = data if isinstance(data, pd.Series) else data.iloc[:, 0]
+    frame = pd.DataFrame({"x": series.index.astype(str), "y": series.values})
+    # Vega-Lite sorts by an encoding channel: the value axis is y for vertical bars, x for horizontal bars
+    order = ("-x" if horizontal else "-y") if sort_desc else None
+    tip = [alt.Tooltip("x:N", title=x_label), alt.Tooltip("y:Q", title=y_label, format=",.1f")]
+    if horizontal:
+        chart = alt.Chart(frame).mark_bar().encode(
+            y=alt.Y("x:N", sort=order, title=x_label, axis=alt.Axis(labelLimit=300)),
+            x=alt.X("y:Q", title=y_label), tooltip=tip)
+    else:
+        chart = alt.Chart(frame).mark_bar().encode(
+            x=alt.X("x:N", sort=order, title=x_label, axis=alt.Axis(labelLimit=300, labelAngle=-90)),
+            y=alt.Y("y:Q", title=y_label), tooltip=tip)
+    show_altair(chart)
+
+
+def rank_history_chart(hist: pd.DataFrame):
+    """Rank over time: rank 1 at the top, axis zoomed to the data, every snapshot marked."""
+    chart = (
+        alt.Chart(hist[["snapshot", "rank", "points"]])
+        .mark_line(point=True)
+        .encode(
+            x=alt.X("snapshot:N", title="Weekly snapshot (year-week)", sort=list(hist["snapshot"]),
+                    axis=alt.Axis(labelAngle=0)),
+            y=alt.Y("rank:Q", title="Rank (1 = best)", scale=alt.Scale(reverse=True, zero=False)),
+            tooltip=[alt.Tooltip("snapshot:N", title="Snapshot"), alt.Tooltip("rank:Q", title="Rank"),
+                     alt.Tooltip("points:Q", title="Points")],
+        )
+    )
+    show_altair(chart)
+
+
+def first_value(df: pd.DataFrame, col: str = "n", default=0):
+    return df[col].iloc[0] if not df.empty and df[col].iloc[0] is not None else default
+
+
+def hist_counts(series: pd.Series, bins: int = 10) -> pd.Series:
+    """Equal-width histogram counts, labelled by bin range, ready for st.bar_chart."""
+    series = series.dropna()
+    if series.empty:
+        return pd.Series(dtype=int)
+    n_bins = max(1, min(bins, series.nunique()))
+    binned = pd.cut(series, bins=n_bins)
+    counts = binned.value_counts().sort_index()
+    counts.index = [f"{int(i.left)}–{int(i.right)}" for i in counts.index]
+    return counts
+
+
+ENV_PATH = os.path.join(PROJECT_ROOT, ".env")
+DB_PAGES = {"Overview", "Competition Explorer", "Venue Explorer", "Rankings", "Competitor Explorer"}
+
+
+def database_problem():
+    """Returns None if MySQL is reachable, otherwise the error text. Not cached, so a fix shows on refresh."""
+    try:
+        get_connection().close()
+        return None
+    except Exception as e:
+        return str(e)
+
+
+# ---------------- Sidebar navigation ----------------
+st.sidebar.title("🎾 Tennis Analytics")
+page = st.sidebar.radio(
+    "Navigate",
+    ["Overview", "Competition Explorer", "Venue Explorer", "Rankings", "Competitor Explorer",
+     "Data Quality", "Project Walkthrough"],
+)
+
+# One clear message instead of a wall of repeated database errors
+if page in DB_PAGES:
+    problem = database_problem()
+    if problem:
+        st.title(page)
+        st.error("Cannot connect to MySQL, so this page cannot load data.")
+        if not os.path.exists(ENV_PATH):
+            st.warning(
+                f"No `.env` file found. It must be named exactly `.env` and sit here: `{ENV_PATH}` "
+                "(next to `main.py`). Copy your old `.env` into that folder, then stop Streamlit "
+                "(Ctrl+C) and start it again."
+            )
+        else:
+            st.warning(
+                "Check `DB_HOST`, `DB_USER`, `DB_PASSWORD` and `DB_NAME` in your `.env`, and that MySQL is running. "
+                "After editing `.env`, stop Streamlit (Ctrl+C) and start it again."
+            )
+        with st.expander("Technical detail"):
+            st.code(problem)
+        st.stop()
+
+# ================================================================
+# PAGE 1: OVERVIEW DASHBOARD
+# ================================================================
+if page == "Overview":
+    st.title("Overview Dashboard")
+
+    st.markdown("""
+    ### About this project
+    **SportRadar Tennis Analytics** parses, stores, and visualizes tennis competition,
+    venue, and doubles-ranking data pulled from the SportRadar Tennis API.
+
+    **Problem it solves:** Tennis competition hierarchies, venue/complex relationships,
+    and doubles rankings each live in separate, hard-to-browse API responses. This app
+    turns them into one queryable, filterable, visual tool — so analysts, event organizers,
+    and enthusiasts can explore competition structures and ranking trends without
+    manually digging through raw JSON or spreadsheets.
+
+    **What it finds:** which categories/tournaments dominate the calendar, how venues
+    and complexes are distributed globally, and who's leading the doubles rankings by
+    country and points.
+    """)
+
+    st.subheader("Dataset Overview")
+    dc1, dc2, dc3 = st.columns(3)
+    dc1.markdown("**Competitions**\n\nCategories → Competitions, with a parent/child "
+                 "link (`parent_id`) and a tournament `level` (e.g. grand_slam, atp_250).")
+    dc2.markdown("**Complexes & Venues**\n\nEach complex (e.g. a sports club) can host "
+                 "multiple venues (individual courts/stadiums) across cities/countries.")
+    dc3.markdown("**Doubles Rankings**\n\nWeekly ranking snapshot of ranked competitors "
+                 "with points, movement, and competitions played.")
+
+    st.divider()
+
+    total_competitors = run_query("SELECT COUNT(*) AS n FROM Competitors")
+    total_countries = run_query("SELECT COUNT(DISTINCT country) AS n FROM Competitors")
+    total_competitions = run_query("SELECT COUNT(*) AS n FROM Competitions")
+    total_venues = run_query("SELECT COUNT(*) AS n FROM Venues")
+    highest_points = run_query(f"SELECT MAX(r.points) AS n FROM Competitor_Rankings r WHERE {LATEST_SNAPSHOT}")
+
+    col1, col2, col3, col4, col5 = st.columns(5)
+    col1.metric("Competitors", int(first_value(total_competitors)))
+    col2.metric("Countries", int(first_value(total_countries)))
+    col3.metric("Competitions", int(first_value(total_competitions)))
+    col4.metric("Venues", int(first_value(total_venues)))
+    col5.metric("Highest Points", int(first_value(highest_points)))
+
+    # ---- Competitions per category ----
+    st.subheader("Competitions per Category")
+    chart_purpose(
+        "how many competitions each category contains (the 15 largest categories).",
+        "it shows which categories dominate the tennis calendar, so you know where most of the activity and data sits.",
+    )
+    df = run_query("""
+        SELECT cat.category_name, COUNT(*) AS competitions
+        FROM Competitions c JOIN Categories cat ON c.category_id = cat.category_id
+        GROUP BY cat.category_name ORDER BY competitions DESC LIMIT 15
+    """)
+    if not df.empty:
+        bar(df.set_index("category_name"), "Category", "Number of competitions")
+        total = int(first_value(total_competitions))
+        top = df.iloc[0]
+        top3 = int(df["competitions"].head(3).sum())
+        st.caption(
+            f"**Insight (measured):** {top['category_name']} holds {int(top['competitions'])} of {total} "
+            f"competitions ({pct(top['competitions'], total)}%); the top 3 categories together hold "
+            f"{pct(top3, total)}%. **Use:** start any calendar or coverage analysis with these "
+            f"categories, since they carry most of the volume."
+        )
+    else:
+        st.info("No data loaded yet. Run the ETL pipeline first (`python main.py`).")
+
+    # ---- Top 10 by points ----
+    st.subheader("Top 10 by Points (latest snapshot)")
+    chart_purpose(
+        "the 10 competitors with the most ranking points in the selected ranking list, in the latest weekly snapshot.",
+        "it shows who leads and how far ahead they are; together with the share below, it shows whether points are concentrated at the top.",
+    )
+    genders = run_query(
+        f"SELECT DISTINCT r.ranking_gender AS g FROM Competitor_Rankings r WHERE {LATEST_SNAPSHOT} ORDER BY g"
+    )
+    if genders.empty:
+        st.info("No ranking data loaded yet.")
+    else:
+        gender = st.selectbox("Ranking list", genders["g"].tolist())
+        top10 = run_query(f"""
+            SELECT co.name, r.points FROM Competitor_Rankings r
+            JOIN Competitors co ON r.competitor_id = co.competitor_id
+            WHERE {LATEST_SNAPSHOT} AND r.ranking_gender = %s
+            ORDER BY r.points DESC, co.name LIMIT 10
+        """, (gender,))
+        conc = run_query(f"""
+            SELECT COUNT(*) AS n, SUM(r.points) AS total,
+                   SUM(CASE WHEN r.`rank` <= 10 THEN r.points ELSE 0 END) AS top10
+            FROM Competitor_Rankings r WHERE {LATEST_SNAPSHOT} AND r.ranking_gender = %s
+        """, (gender,))
+        if not top10.empty:
+            bar(top10.set_index("name"), "Competitor", "Ranking points")
+            if not conc.empty and conc["total"].iloc[0]:
+                n, total_pts, top10_pts = (int(conc[c].iloc[0]) for c in ("n", "total", "top10"))
+                share = pct(top10_pts, total_pts)
+                k = min(10, n)
+                even = pct(k, n)
+                ratio = f" An even split would give them {even}%, so the top is {round(share / even, 1)}× over-represented." \
+                    if n > 10 and even else ""
+                st.caption(
+                    f"**Insight (measured):** among {n} ranked competitors, those ranked 10th or better hold "
+                    f"{share}% of all points.{ratio} "
+                    f"**Use:** the points race is decided near the top; mid-table gaps matter little for headline rankings."
+                )
+
+# ================================================================
+# PAGE 2: COMPETITION EXPLORER
+# ================================================================
+elif page == "Competition Explorer":
+    st.title("Competition Explorer")
+
+    categories_df = run_query("SELECT DISTINCT category_name FROM Categories ORDER BY category_name")
+    cat_options = ["All"] + categories_df["category_name"].tolist() if not categories_df.empty else ["All"]
+    levels_df = run_query(
+        "SELECT DISTINCT category_level FROM Competitions WHERE category_level IS NOT NULL ORDER BY category_level"
+    )
+    level_options = ["All"] + levels_df["category_level"].tolist() if not levels_df.empty else ["All"]
+
+    col1, col2, col3, col4 = st.columns(4)
+    search = col1.text_input("Search competition name")
+    category_filter = col2.selectbox("Category", cat_options)
+    type_filter = col3.selectbox("Type", ["All", "singles", "doubles", "mixed_doubles", "mixed"])
+    level_filter = col4.selectbox("Level", level_options)
+
+    sql = """
+        SELECT c.competition_name, c.type, c.gender, cat.category_name, c.category_level
+        FROM Competitions c JOIN Categories cat ON c.category_id = cat.category_id
+        WHERE 1=1
+    """
+    params = []
+    if search:
+        sql += " AND c.competition_name LIKE %s"
+        params.append(f"%{search}%")
+    if category_filter != "All":
+        sql += " AND cat.category_name = %s"
+        params.append(category_filter)
+    if type_filter != "All":
+        sql += " AND c.type = %s"
+        params.append(type_filter)
+    if level_filter != "All":
+        sql += " AND c.category_level = %s"
+        params.append(level_filter)
+
+    df = run_query(sql, tuple(params))
+    if df.empty:
+        st.info("No competitions match — try different filters, or load data first.")
+    else:
+        st.caption(f"{len(df)} competitions match. Showing the first 1,000 rows in the table.")
+        show_df(df.head(1000).drop(columns=["category_level"]))
+        with st.expander("Which categories have a tournament level?"):
+            coverage = run_query("""
+                SELECT cat.category_name AS category, COUNT(*) AS competitions,
+                       SUM(CASE WHEN c.category_level IS NOT NULL THEN 1 ELSE 0 END) AS with_level
+                FROM Competitions c JOIN Categories cat ON c.category_id = cat.category_id
+                GROUP BY cat.category_name ORDER BY competitions DESC
+            """)
+            if not coverage.empty:
+                coverage["with_level"] = coverage["with_level"].astype(int)
+                coverage["% with level"] = (100 * coverage["with_level"] / coverage["competitions"]).round(1)
+                show_df(coverage, hide_index=True)
+                st.caption("Measured from your database: a category has levels only where the API provides them.")
+
+        st.subheader("Distribution by type")
+        chart_purpose(
+            "how many of the competitions matching your filters are singles, doubles, mixed or mixed doubles.",
+            "it shows the event mix, so you can see how much of the calendar is doubles versus singles before planning coverage or analysis.",
+        )
+        type_counts = df["type"].value_counts()
+        bar(type_counts, "Competition type", "Number of competitions")
+        shares = ", ".join(f"{t} {pct(n, len(df))}%" for t, n in type_counts.items())
+        st.caption(
+            f"**Insight (measured):** {shares} of the {len(df)} competitions shown. "
+            f"**Use:** if you plan coverage or resources per event type, weight them by these shares."
+        )
+
+        st.subheader("Distribution by level")
+        chart_purpose(
+            "how many competitions fall in each tournament tier (for example grand_slam or atp_250), among those that have a level.",
+            "it separates top-tier events from smaller ones, so a Grand Slam is not compared with a small event as if they were equal.",
+        )
+        level_counts = df["category_level"].dropna().value_counts()
+        if level_counts.empty:
+            st.info("No `level` values for these rows. If you expected some, re-run `python main.py` "
+                    "(the level extraction was fixed after the first load).")
+        else:
+            bar(level_counts, "Tournament level", "Number of competitions")
+            labelled = int(level_counts.sum())
+            level_cats = sorted(df.loc[df["category_level"].notna(), "category_name"].unique())
+            st.caption(
+                f"**Insight (measured):** {labelled} of {len(df)} competitions ({pct(labelled, len(df))}%) carry a level; "
+                f"the most common is '{level_counts.idxmax()}' ({int(level_counts.max())}). "
+                f"Levels appear only in these categories: {', '.join(level_cats)}. "
+                f"Other competitions have no level in the API response, so level-based comparisons cover only that labelled share."
+            )
+
+# ================================================================
+# PAGE 3: VENUE EXPLORER
+# ================================================================
+elif page == "Venue Explorer":
+    st.title("Venue Explorer")
+
+    countries_df = run_query("SELECT DISTINCT country_name FROM Venues ORDER BY country_name")
+    country_options = ["All"] + countries_df["country_name"].tolist() if not countries_df.empty else ["All"]
+
+    col1, col2 = st.columns(2)
+    country_filter = col1.selectbox("Country", country_options)
+    venue_search = col2.text_input("Search venue name")
+
+    sql = """
+        SELECT v.venue_name, cx.complex_name, v.city_name, v.country_name, v.timezone
+        FROM Venues v JOIN Complexes cx ON v.complex_id = cx.complex_id
+        WHERE 1=1
+    """
+    params = []
+    if country_filter != "All":
+        sql += " AND v.country_name = %s"
+        params.append(country_filter)
+    if venue_search:
+        sql += " AND v.venue_name LIKE %s"
+        params.append(f"%{venue_search}%")
+
+    df = run_query(sql, tuple(params))
+    if df.empty:
+        st.info("No venues match — try different filters, or load data first.")
+    else:
+        st.caption(f"{len(df)} venues match. Showing the first 1,000 rows in the table.")
+        show_df(df.head(1000))
+        st.subheader("Venues per country (top 20)")
+        chart_purpose(
+            "the number of venues (courts/stadiums) in each of the 20 countries with the most venues, for the venues matching your filters.",
+            "it shows where tennis venue infrastructure is concentrated, which helps when deciding where events or resources could be placed. These are raw counts, not adjusted for country size.",
+        )
+        country_counts = df["country_name"].value_counts()
+        bar(country_counts.head(20), "Country", "Number of venues", horizontal=True)
+        top1 = int(country_counts.iloc[0])
+        top3 = int(country_counts.head(3).sum())
+        st.caption(
+            f"**Insight (measured):** {country_counts.index[0]} has {top1} of {len(df)} venues "
+            f"({pct(top1, len(df))}%); the top 3 countries hold {pct(top3, len(df))}% and the 20 shown hold "
+            f"{pct(int(country_counts.head(20).sum()), len(df))}% of venues, out of {len(country_counts)} countries in total. "
+            f"Raw counts only: this does not adjust for country size or tour activity."
+        )
+
+# ================================================================
+# PAGE 4: RANKINGS
+# ================================================================
+elif page == "Rankings":
+    st.title("Rankings Leaderboard")
+
+    snap = run_query("""
+        SELECT ranking_year, ranking_week FROM Competitor_Rankings
+        ORDER BY ranking_year DESC, ranking_week DESC LIMIT 1
+    """)
+    if snap.empty:
+        st.info("No ranking data loaded yet. Run `python main.py`.")
+        st.stop()
+    st.caption(f"Latest snapshot: year {int(snap['ranking_year'].iloc[0])}, week {int(snap['ranking_week'].iloc[0])}")
+
+    countries_df = run_query("SELECT DISTINCT country FROM Competitors ORDER BY country")
+    country_options = ["All"] + countries_df["country"].tolist() if not countries_df.empty else ["All"]
+    genders = run_query(f"SELECT DISTINCT r.ranking_gender AS g FROM Competitor_Rankings r WHERE {LATEST_SNAPSHOT} ORDER BY g")
+    gender_options = ["All"] + genders["g"].tolist() if not genders.empty else ["All"]
+
+    col1, col2, col3, col4 = st.columns(4)
+    rank_max = col1.slider("Max rank", 1, 200, 50)
+    country_filter = col2.selectbox("Country", country_options)
+    points_min = col3.number_input("Min points", min_value=0, value=0, step=100)
+    gender_filter = col4.selectbox("Ranking list", gender_options)
+
+    sql = f"""
+        SELECT r.`rank`, co.name, co.country, r.points, r.movement, r.competitions_played, r.ranking_gender
+        FROM Competitor_Rankings r JOIN Competitors co ON r.competitor_id = co.competitor_id
+        WHERE {LATEST_SNAPSHOT} AND r.`rank` <= %s AND r.points >= %s
+    """
+    params = [rank_max, points_min]
+    if country_filter != "All":
+        sql += " AND co.country = %s"
+        params.append(country_filter)
+    if gender_filter != "All":
+        sql += " AND r.ranking_gender = %s"
+        params.append(gender_filter)
+    sql += " ORDER BY r.ranking_gender, r.`rank`, co.name"
+
+    df = run_query(sql, tuple(params))
+    if df.empty:
+        st.info("No competitors match — try different filters, or load data first.")
+    else:
+        show_df(df)
+
+        # ---- Distribution of points ----
+        st.subheader("How are points and workload distributed?")
+        q1, q3 = df["points"].quantile([0.25, 0.75])
+        fence = q3 + 1.5 * (q3 - q1)
+        outliers = int((df["points"] > fence).sum())
+        mean_pts, median_pts = round(df["points"].mean(), 1), round(df["points"].median(), 1)
+        skew = ("a few high scorers pull the mean above the median, so use the median when comparing groups"
+                if mean_pts > median_pts * 1.1 else "mean and median are close, so the average is representative")
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("**Ranking points per competitor**")
+            chart_purpose(
+                "how many competitors fall into each range of ranking points (a histogram).",
+                "it reveals the shape of the field: whether most competitors have few points and a few have many, which decides whether the mean or the median is the fair summary.",
+            )
+            bar(hist_counts(df["points"]), "Points range", "Number of competitors", sort_desc=False)
+            st.caption(
+                f"**Insight (measured):** across the {len(df)} rows shown, mean points are {mean_pts} and median {median_pts}: {skew}. "
+                f"{outliers} competitor(s) exceed the outlier fence ({round(fence)} points). "
+                f"The rank filter cuts off the lower tail, so widen it to see the full shape."
+            )
+        with c2:
+            st.markdown("**Competitions played per competitor**")
+            chart_purpose(
+                "how many competitors played each number of competitions (a histogram).",
+                "it shows how much workload varies across the field, which you need in order to read the points-per-competition efficiency table fairly.",
+            )
+            bar(hist_counts(df["competitions_played"]), "Competitions played (range)", "Number of competitors", sort_desc=False)
+            cp = df["competitions_played"]
+            corr = df["points"].corr(cp)
+            if pd.isna(corr):
+                relation = "too little variation to measure how points relate to workload"
+            else:
+                strength = "weak" if abs(corr) < 0.3 else "moderate" if abs(corr) < 0.6 else "strong"
+                direction = "positive" if corr > 0 else "negative"
+                relation = f"points and competitions played have a {strength} {direction} correlation (r = {corr:.2f})"
+                if corr >= 0.3:
+                    relation += ", so players who play more tend to score more; use points per competition (below) for a fairer comparison"
+            st.caption(
+                f"**Insight (measured):** competitors played between {int(cp.min())} and {int(cp.max())} competitions "
+                f"(median {round(cp.median(), 1)}); {relation}."
+            )
+
+        # ---- Country analysis with minimum sample size ----
+        st.subheader("Country analysis (minimum sample size)")
+        min_n = st.slider("Minimum competitors per country", 1, 10, 3,
+                          help="Hides countries with very few competitors so a 1–2 player country can't top the average.")
+        by_country = run_query(f"""
+            SELECT co.country, COUNT(DISTINCT co.competitor_id) AS competitors,
+                   SUM(r.points) AS total_points, ROUND(AVG(r.points), 1) AS avg_points
+            FROM Competitor_Rankings r JOIN Competitors co ON r.competitor_id = co.competitor_id
+            WHERE {LATEST_SNAPSHOT}
+            GROUP BY co.country
+            HAVING COUNT(DISTINCT co.competitor_id) >= %s
+            ORDER BY avg_points DESC LIMIT 15
+        """, (min_n,))
+        all_countries = run_query(f"""
+            SELECT COUNT(DISTINCT co.country) AS n FROM Competitor_Rankings r
+            JOIN Competitors co ON r.competitor_id = co.competitor_id WHERE {LATEST_SNAPSHOT}
+        """)
+        eligible = run_query(f"""
+            SELECT COUNT(*) AS n FROM (
+                SELECT co.country FROM Competitor_Rankings r
+                JOIN Competitors co ON r.competitor_id = co.competitor_id
+                WHERE {LATEST_SNAPSHOT}
+                GROUP BY co.country HAVING COUNT(DISTINCT co.competitor_id) >= %s
+            ) t
+        """, (min_n,))
+        if by_country.empty:
+            st.info("No country meets that minimum sample size.")
+        else:
+            show_df(by_country)
+            st.subheader("Average points per competitor, by country")
+            chart_purpose(
+                f"the average ranking points per competitor (men's and women's lists combined) for the countries with at least {min_n} ranked competitors; the 15 highest averages are shown.",
+                "it compares countries per player instead of in total, so a country is not ranked highly just because it has many players. "
+                "The minimum-sample slider hides countries with too few players for a reliable average.",
+            )
+            bar(by_country.set_index("country")["avg_points"], "Country", "Average points per competitor")
+            top = by_country.iloc[0]
+            st.caption(
+                f"**Insight (measured):** among countries with at least {min_n} competitors, {top['country']} has the highest "
+                f"average points ({top['avg_points']}) across {int(top['competitors'])} competitors. "
+                f"{int(first_value(eligible))} of {int(first_value(all_countries))} countries have at least {min_n} competitors; "
+                f"the {len(by_country)} with the highest averages are shown. Countries below the minimum are excluded because their averages are unreliable."
+            )
+
+        st.subheader("Total points by country (top 10)")
+        chart_purpose(
+            "the sum of ranking points (men's and women's lists combined) held by competitors from each of the 10 countries with the most points.",
+            "it shows overall national strength and depth. Compare it with the average chart above: a high total with a low average means many players, a high average means strong players.",
+        )
+        total_by_country = run_query(f"""
+            SELECT co.country, SUM(r.points) AS total_points
+            FROM Competitor_Rankings r JOIN Competitors co ON r.competitor_id = co.competitor_id
+            WHERE {LATEST_SNAPSHOT}
+            GROUP BY co.country ORDER BY total_points DESC LIMIT 10
+        """)
+        grand_total = run_query(f"SELECT SUM(r.points) AS n FROM Competitor_Rankings r WHERE {LATEST_SNAPSHOT}")
+        if not total_by_country.empty:
+            bar(total_by_country.set_index("country"), "Country", "Total ranking points")
+            top10_total = int(total_by_country["total_points"].sum())
+            if "Neutral" in total_by_country["country"].values:
+                st.caption("Note: 'Neutral' is a value in the data's country field, not a real country. It groups competitors "
+                           "without a national affiliation in the data (exact meaning **to be verified**).")
+            st.caption(
+                f"**Insight (measured):** {total_by_country.iloc[0]['country']} holds "
+                f"{pct(total_by_country.iloc[0]['total_points'], first_value(grand_total))}% of all ranking points; "
+                f"the top 10 countries hold {pct(top10_total, first_value(grand_total))}%. "
+                f"Totals reward having many ranked players, which is why the average view above is the fairer comparison."
+            )
+
+        # ---- Efficiency ----
+        st.subheader("Most efficient (points per competition played)")
+        chart_purpose(
+            "the 10 competitors who earn the most ranking points per competition played (a table).",
+            "raw points reward playing more events; dividing by competitions played shows who earns the most for each event, not who simply plays the most.",
+        )
+        efficiency = run_query(f"""
+            SELECT co.name, co.country, r.points, r.competitions_played,
+                   ROUND(r.points / NULLIF(r.competitions_played, 0), 1) AS points_per_competition
+            FROM Competitor_Rankings r JOIN Competitors co ON r.competitor_id = co.competitor_id
+            WHERE {LATEST_SNAPSHOT} AND r.competitions_played > 0
+            ORDER BY points_per_competition DESC LIMIT 10
+        """)
+        if not efficiency.empty:
+            show_df(efficiency)
+            avg_ppc = run_query(f"""
+                SELECT AVG(r.points / r.competitions_played) AS n
+                FROM Competitor_Rankings r WHERE {LATEST_SNAPSHOT} AND r.competitions_played > 0
+            """)
+            avg_val = first_value(avg_ppc)
+            best = efficiency.iloc[0]
+            if avg_val:
+                st.caption(
+                    f"**Insight (measured):** {best['name']} earns {best['points_per_competition']} points per competition, "
+                    f"{round(best['points_per_competition'] / avg_val, 1)}× the field average of {round(float(avg_val), 1)}. "
+                    f"**Use:** this identifies high-impact players who are not obvious from total points alone."
+                )
+
+    # ---- Window-function view: concentration ----
+    st.subheader("Points concentration")
+    chart_purpose(
+        "each competitor's share of all ranking points, and the running total of that share from rank 1 downwards (a table built with SQL window functions).",
+        "it shows how few competitors account for most of the points, which tells you whether the ranking is top-heavy.",
+    )
+    lb = run_query(f"""
+        SELECT ranking_gender, `rank`, name, country, points, pct_of_total_points,
+               cumulative_pct_of_points, points_dense_rank
+        FROM v_ranking_leaderboard
+        WHERE {LATEST_SNAPSHOT_BARE}
+        ORDER BY ranking_gender, `rank`, name LIMIT 25
+    """, quiet=True)
+    if lb.empty:
+        st.info("The analytical views are not created yet. Run `python main.py` once to create them.")
+    else:
+        show_df(lb)
+        top10_rows = lb[lb["rank"] <= 10]
+        if not top10_rows.empty:
+            parts = [f"{g}: top 10 hold {round(float(v), 1)}% of points"
+                     for g, v in top10_rows.groupby("ranking_gender")["cumulative_pct_of_points"].max().items()]
+            st.caption("**Insight (measured):** " + "; ".join(parts) + ".")
+        
+
+    # ---- Trends ----
+    st.subheader("Rank movement over time")
+    chart_purpose(
+        "how many places each competitor gained or lost between their previous stored snapshot and the latest one (two tables: biggest risers and biggest fallers).",
+        "it shows momentum: who is improving or slipping. Snapshots are the weeks the pipeline was run, so the comparison may span more than one week.",
+    )
+    n_snap = run_query("SELECT COUNT(*) AS n FROM (SELECT DISTINCT ranking_year, ranking_week FROM Competitor_Rankings) s")
+    if int(first_value(n_snap)) < 2:
+        st.info("Only one weekly snapshot has been collected so far, so there is no time-series to analyse yet. "
+                "Each weekly `python main.py` run now adds a new snapshot instead of overwriting the old one; "
+                "once two or more exist, risers and fallers appear here.")
+    else:
+        moves = run_query(f"""
+            SELECT name, country, ranking_gender, prev_rank, `rank`, (prev_rank - `rank`) AS places_gained
+            FROM v_rank_history
+            WHERE {LATEST_SNAPSHOT_BARE} AND prev_rank IS NOT NULL
+        """, quiet=True)
+        if moves.empty:
+            st.info("Snapshots exist but no competitor appears in two of them yet.")
+        else:
+            tidy = {"name": "Competitor", "country": "Country", "prev_rank": "Previous rank",
+                    "rank": "Current rank", "places_gained": "Places gained"}
+            view = moves.rename(columns=tidy)[list(tidy.values())]
+            ca, cb = st.columns(2)
+            ca.markdown("**Biggest risers**")
+            show_df(view.sort_values("Places gained", ascending=False).head(10), container=ca, hide_index=True)
+            cb.markdown("**Biggest fallers**")
+            show_df(view.sort_values("Places gained").head(10), container=cb, hide_index=True)
+            snaps = run_query("""
+                SELECT DISTINCT ranking_year, ranking_week FROM Competitor_Rankings
+                ORDER BY ranking_year DESC, ranking_week DESC LIMIT 2
+            """)
+            span = ""
+            if len(snaps) == 2:
+                span = (f"comparing {int(snaps['ranking_year'].iloc[1])} week {int(snaps['ranking_week'].iloc[1])} with "
+                        f"{int(snaps['ranking_year'].iloc[0])} week {int(snaps['ranking_week'].iloc[0])} (both men's and women's lists): ")
+            up = moves.sort_values("places_gained", ascending=False).iloc[0]
+            down = moves.sort_values("places_gained").iloc[0]
+            st.caption(
+                f"**Insight (measured):** {span}largest rise: {up['name']} (+{int(up['places_gained'])} places, rank {int(up['prev_rank'])} → {int(up['rank'])}); "
+                f"largest fall: {down['name']} ({int(down['places_gained'])} places, rank {int(down['prev_rank'])} → {int(down['rank'])}). "
+                f"{int((moves['places_gained'] > 0).sum())} competitors improved, {int((moves['places_gained'] < 0).sum())} dropped, "
+                f"{int((moves['places_gained'] == 0).sum())} unchanged."
+            )
+
+# ================================================================
+# PAGE 5: COMPETITOR EXPLORER
+# ================================================================
+elif page == "Competitor Explorer":
+    st.title("Competitor Explorer")
+
+    names_df = run_query("SELECT DISTINCT name FROM Competitors ORDER BY name")
+    if names_df.empty:
+        st.info("No competitors loaded yet. Run the ETL pipeline first.")
+    else:
+        selected = st.selectbox("Select a competitor", names_df["name"].tolist())
+        df = run_query("""
+            SELECT co.name, co.country, co.abbreviation, r.`rank`, r.movement, r.points,
+                   r.competitions_played, r.ranking_year, r.ranking_week, r.ranking_gender
+            FROM Competitors co JOIN Competitor_Rankings r ON co.competitor_id = r.competitor_id
+            WHERE co.name = %s
+            ORDER BY r.ranking_year DESC, r.ranking_week DESC
+        """, (selected,))
+        if not df.empty:
+            row = df.iloc[0]
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("Rank", int(row["rank"]))
+            col2.metric("Points", int(row["points"]))
+            col3.metric("Movement", int(row["movement"]), help="Rank change versus the previous week, as reported by SportRadar")
+            col4.metric("Competitions Played", int(row["competitions_played"]))
+            st.write(f"**Country:** {row['country']} ({row['abbreviation']}) — "
+                     f"latest snapshot: {int(row['ranking_year'])} week {int(row['ranking_week'])}")
+            st.subheader("Rank history")
+            chart_purpose(
+                "this competitor's rank in each weekly snapshot stored in the database. Rank 1 is at the top, so a line going up means the competitor improved.",
+                "it shows whether the competitor is rising or falling over time, not just where they stand today.",
+            )
+            if len(df) < 2:
+                st.info("Only one weekly snapshot is stored for this competitor, so there is no history to chart yet. "
+                        "Each new `python main.py` run adds another snapshot.")
+            else:
+                hist = df.sort_values(["ranking_year", "ranking_week"]).copy()
+                hist["snapshot"] = hist["ranking_year"].astype(str) + "-W" + hist["ranking_week"].astype(str)
+                rank_history_chart(hist)
+                first, last = hist.iloc[0], hist.iloc[-1]
+                change = int(first["rank"]) - int(last["rank"])
+                direction = (f"improved by {change} places" if change > 0
+                             else f"dropped by {abs(change)} places" if change < 0 else "did not change rank")
+                st.caption(
+                    f"**Insight (measured):** from {first['snapshot']} to {last['snapshot']} {row['name']} {direction} "
+                    f"(rank {int(first['rank'])} → {int(last['rank'])}) and moved from {int(first['points'])} to {int(last['points'])} points. "
+                    f"The chart compares the weeks the pipeline was run, which may not be consecutive weeks, "
+                    f"so it can differ from the weekly 'Movement' figure above."
+                )
+                show_df(hist[["snapshot", "rank", "points", "movement", "competitions_played"]], hide_index=True)
+        else:
+            st.warning("No ranking data found for this competitor.")
+
+# ================================================================
+# PAGE 6: DATA QUALITY
+# ================================================================
+elif page == "Data Quality":
+    st.title("Data Quality Report")
+    st.write(
+        "Live results from the last ETL run: what the raw data looked like, whether any rows were lost "
+        "between stages, and what validation found. Every number here is measured, not assumed."
+    )
+
+    report_path = os.path.join(PROJECT_ROOT, "data", "quality_report.json")
+    if not os.path.exists(report_path):
+        st.warning("No quality report found yet. Run `python main.py` at least once to generate it.")
+        st.stop()
+    with open(report_path, "r", encoding="utf-8") as f:
+        qr = json.load(f)
+
+    status = qr.get("status", "UNKNOWN (report from an older pipeline version — rerun `python main.py`)")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Last run status", status.split(" ")[0])
+    c2.metric("Last run", str(qr.get("run_at", "unknown"))[:19].replace("T", " "))
+    c3.metric("Duration (s)", qr.get("duration_seconds", "—"))
+    if qr.get("error"):
+        st.error(qr["error"])
+
+    # ---- 1. Raw -> transformed ----
+    st.subheader("1. No rows lost between API and transform")
+    rvt = qr.get("raw_vs_transformed")
+    if rvt:
+        rows = [{"entity": k, "in API response": v["raw"], "after transform": v["transformed"],
+                 "match": "✅" if v["match"] else "⚠️ records skipped"} for k, v in rvt.items()]
+        show_df(pd.DataFrame(rows), hide_index=True)
+    else:
+        st.info("Not available — rerun `python main.py` with the latest pipeline.")
+
+    # ---- 2. Loaded vs DB ----
+    st.subheader("2. Everything loaded is actually in the database")
+    rec = qr.get("db_reconciliation")
+    if rec:
+        rows = []
+        for k, v in rec.items():
+            if "in_database" in v:
+                rows.append({"table": k, "unique rows this run": v["unique_rows_this_run"],
+                             "in database": v["in_database"], "ok": "✅" if v["ok"] else "❌"})
+        show_df(pd.DataFrame(rows), hide_index=True)
+        dup = rec.get("rankings_duplicate_groups_in_db", {})
+        st.caption(f"Duplicate ranking rows in the database: {dup.get('count', '—')} "
+                   f"({'✅ none' if dup.get('ok') else '❌ check the UNIQUE KEY uq_competitor_week'}). "
+                   "Rankings accumulate week over week, so the database may legitimately hold more rows than one run loads.")
+    else:
+        st.info("Not available — rerun `python main.py` with the latest pipeline.")
+
+    # ---- 3. Profile ----
+    st.subheader("3. Profile of the raw API data (measured)")
+    prof = qr.get("profile")
+    if not prof:
+        st.info("Not available — rerun `python main.py` with the latest pipeline.")
+    else:
+        pc = prof.get("competitions", {})
+        if pc:
+            st.markdown("**Competitions**")
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Competitions", pc.get("total"))
+            m2.metric("Top-level (no parent_id)", pc.get("top_level_no_parent"))
+            m3.metric("parent_id resolves in dataset", f"{pc.get('parent_id_resolve_pct')}%")
+            m4.metric("Have a level", f"{pct(pc.get('level_present', 0), pc.get('total', 0))}%")
+            st.caption(
+                f"Measured: {pc.get('parent_id_unresolved')} of {pc.get('with_parent_id')} parent_id values do not match any "
+                f"competition_id in this response. Explanation: **to be verified** — the endpoint appears to return sub-events "
+                f"without their parent entries (check with the SQL below or the SportRadar documentation). "
+                f"The foreign key is therefore not enforced when loading competitions."
+            )
+            with st.expander("SQL to verify the parent_id finding yourself"):
+                st.code("""SELECT c.parent_id, COUNT(*) AS children
+FROM Competitions c
+LEFT JOIN Competitions p ON c.parent_id = p.competition_id
+WHERE c.parent_id IS NOT NULL AND p.competition_id IS NULL
+GROUP BY c.parent_id
+ORDER BY children DESC
+LIMIT 10;""", language="sql")
+            if pc.get("level_values"):
+                st.write("Level values found:", pc["level_values"])
+        px = prof.get("complexes", {})
+        if px:
+            st.markdown("**Complexes and venues**")
+            n1, n2, n3, n4 = st.columns(4)
+            n1.metric("Complexes", px.get("complexes"))
+            n2.metric("…without venues", px.get("complexes_without_venues"))
+            n3.metric("Venues", px.get("venues"))
+            n4.metric("Countries", px.get("distinct_countries"))
+        pr = prof.get("rankings", {})
+        if pr:
+            st.markdown("**Rankings**")
+            st.write("Snapshots:", pr.get("snapshots"))
+            r1, r2, r3 = st.columns(3)
+            r1.metric("Ranking rows", pr.get("ranking_rows"))
+            r2.metric("Rows tied on rank", pr.get("rows_sharing_a_rank_with_another_row"))
+            r3.metric("No movement", f"{pr.get('movement_zero_pct')}%")
+            pts = pr.get("points", {})
+            if pts.get("count"):
+                st.caption(
+                    f"Points: min {pts['min']}, median {pts['median']}, mean {pts['mean']}, max {pts['max']}; "
+                    f"{pts['iqr_outliers']} value(s) beyond the IQR fence ({pts['iqr_upper_fence']}). "
+                    f"Ties are valid in tennis rankings, so they are reported but not treated as errors."
+                )
+
+    # ---- 4. Validation ----
+    st.subheader("4. Validation results by table")
+    st.caption("Issues are tiered: **critical** issues (duplicate keys, negative points or rank) stop the load; "
+               "**informational** flags (like `orphan_parent_refs`, explained above) are reported but not treated as defects.")
+    validation = qr.get("validation", {})
+    for table, checks in validation.items():
+        sev = checks.get("_severity", {})
+        real_issues = {k: checks[k] for k in sev.get("critical_keys", [])}
+        expected_issues = {k: checks[k] for k in sev.get("informational_keys", [])}
+        if real_issues:
+            st.error(f"**{table}** — {checks.get('total', 0)} records — critical issues: {list(real_issues.keys())}")
+            with st.expander("Show details"):
+                st.json(real_issues)
+        else:
+            st.success(f"**{table}** — {checks.get('total', 0)} records — no critical issues found")
+        for k, v in expected_issues.items():
+            count = len(v) if isinstance(v, list) else v
+            st.info(f"ℹ️ {table}: {count} rows flagged for `{k}` (informational)")
+            if isinstance(v, list) and v:
+                with st.expander(f"Show flagged IDs ({len(v)})"):
+                    st.write(v[:50])
+                    if len(v) > 50:
+                        st.caption(f"...and {len(v) - 50} more")
+        if "note" in checks:
+            st.caption(checks["note"])
+
+    # ---- 5. Views + run history ----
+    st.subheader("5. Analytical views and run history")
+    views = qr.get("views")
+    if views:
+        st.write(f"Views created: {views.get('applied')}, failed: {len(views.get('failed', []))}")
+        for err in views.get("failed", []):
+            st.error(err)
+    history = run_query("SELECT run_id, run_at, status FROM ETL_Run_Log ORDER BY run_id DESC LIMIT 10", quiet=True)
+    if history.empty:
+        st.caption("No run history yet (the ETL_Run_Log table is filled by `python main.py`).")
+    else:
+        show_df(history, hide_index=True)
+
+# ================================================================
+# PAGE 7: PROJECT WALKTHROUGH (presentation aid)
+# ================================================================
+elif page == "Project Walkthrough":
+    st.title("Project Walkthrough")
+    st.caption("Everything needed to present this project live, in one place.")
+
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+        "1. Architecture", "2. Data Model & Deviations", "3. ETL & Error Handling",
+        "4. SQL Queries", "5. Limitations & Next Steps", "ERD", "Data Dictionary"
+    ])
+
+    with tab1:
+        st.subheader("Architecture")
+        st.code("""
+SportRadar API
+     ↓
+Python Extraction (api/, etl/extract.py)  → raw JSON + timestamped archive
+     ↓
+Profiling (etl/profile.py)                → measured facts about the raw data
+     ↓
+Transformation (etl/transform.py)         → flat relational rows
+     ↓
+Validation (etl/validate.py)              → critical vs informational issues
+     ↓
+Load (etl/load.py)                        → MySQL (upserts, one transaction)
+     ↓
+Views + Reconciliation + Run log          → window-function views, row-count proof
+     ↓
+SQL Analysis + Streamlit Dashboard
+        """, language=None)
+        st.markdown("""
+        Each stage has exactly one job:
+        - **Extract** — fetches and saves raw JSON (latest copy + immutable timestamped archive)
+        - **Profile** — measures the raw data (null rates, uniques, coverage, outliers) before anything is assumed
+        - **Transform** — flattens nested JSON into relational rows, dedupes shared entities
+        - **Validate** — checks integrity; critical issues stop the load
+        - **Load** — upserts into MySQL, rolls back on any failure
+        - **Streamlit** — reads from MySQL only, never touches the API directly
+        """)
+
+    with tab2:
+        st.subheader("Data Model & Real-World Deviations")
+        st.write("The brief assumed a simpler schema. Checking the **actual** API response showed differences:")
+        st.markdown("""
+        | What the spec assumed | What the API actually returns | What I did |
+        |---|---|---|
+        | No tournament tier | A `level` field (e.g. `grand_slam`, `atp_250`) **on the competition object, next to `category`** | Added `category_level`. A first version read it from inside `category` and stored NULL everywhere; found during a review against the raw sample and fixed |
+        | Flat ranking rows | Rankings nested under a weekly snapshot (`year`/`week`/`gender`) | Added `ranking_year`, `ranking_week`, `ranking_gender` to each row |
+        | Every complex has venues | Some complexes have no venues | Transform handles a missing `venues` key; measured on the Data Quality page |
+        | `parent_id` always resolves to another competition | Most `parent_id` values do **not** match any competition_id in the response (exact % on the Data Quality page); cause **to be verified** | FK not enforced when loading competitions; documented |
+        """)
+        st.caption("Full reasoning for every decision is in `DECISIONS.md` in the repo.")
+        with st.expander("View live schema.sql"):
+            schema_path = os.path.join(PROJECT_ROOT, "database", "schema.sql")
+            if os.path.exists(schema_path):
+                with open(schema_path, "r", encoding="utf-8") as f:
+                    st.code(f.read(), language="sql")
+            else:
+                st.info("schema.sql not found at expected path.")
+
+    with tab3:
+        st.subheader("ETL Pipeline & Error Handling")
+        st.markdown("""
+        **Extraction** (`api/client.py`, `etl/extract.py`)
+        - Retries on timeout/connection error with backoff; waits and retries on HTTP 429 (rate limit)
+        - Raises a clear error on invalid JSON instead of failing silently
+        - Keeps the latest raw file and an immutable timestamped copy of every run
+
+        **Profiling** (`etl/profile.py`)
+        - Measures null rates, unique counts, parent_id coverage, tie counts, and IQR outliers on the raw data
+
+        **Transformation** (`etl/transform.py`)
+        - Skips malformed records (missing IDs) with a logged warning, never crashing the batch
+        - Dedupes shared entities (categories, competitors)
+
+        **Validation** (`etl/validate.py`)
+        - **Critical** issues (duplicate keys, negative points/rank) stop the load; **informational** ones are reported only
+
+        **Load** (`etl/load.py`)
+        - One transaction with full rollback on error; idempotent upserts; rankings keyed on (competitor, year, week, gender)
+
+        **After load**
+        - Reconciliation proves counts match (API → transform → database)
+        - Every run is written to `ETL_Run_Log` (success or failure)
+        """)
+        st.caption("57 automated tests cover profiling, transform, validation, reconciliation, the SQL views (on a SQLite stand-in), and pipeline orchestration — see `tests/`.")
+
+    with tab4:
+        st.subheader("SQL Analytical Queries")
+        st.write("20 mandatory queries (7 competitions + 7 venues + 6 rankings), additional analytical queries, and 4 window-function views.")
+        queries_path = os.path.join(PROJECT_ROOT, "analysis", "analysis_queries.sql")
+        if os.path.exists(queries_path):
+            with open(queries_path, "r", encoding="utf-8") as f:
+                with st.expander("View full analysis_queries.sql"):
+                    st.code(f.read(), language="sql")
+        views_path = os.path.join(PROJECT_ROOT, "database", "views.sql")
+        if os.path.exists(views_path):
+            with open(views_path, "r", encoding="utf-8") as f:
+                with st.expander("View database/views.sql (window functions: DENSE_RANK, SUM OVER, LAG)"):
+                    st.code(f.read(), language="sql")
+        explain_path = os.path.join(PROJECT_ROOT, "analysis", "explain_queries.sql")
+        if os.path.exists(explain_path):
+            with open(explain_path, "r", encoding="utf-8") as f:
+                with st.expander("EXPLAIN statements (index usage)"):
+                    st.code(f.read(), language="sql")
+        st.markdown("""
+        **Worth highlighting live:**
+        - Q6 — competition type distribution by category
+        - A4 — points per competition played (normalises by events played instead of rewarding raw totals)
+        - `v_ranking_leaderboard` — tie-safe rank plus cumulative share of points using window functions
+        """)
+
+    with tab5:
+        st.subheader("Limitations & Future Implementation")
+
+        st.markdown("### Limitations of this project")
+        st.markdown("""
+        **Data**
+        - **Rank history only covers the weeks the pipeline was run.** Snapshots can be weeks apart, so the rank-history chart and the
+          risers/fallers compare those stored weeks, not every week. The API's own `movement` field compares with the previous week.
+        - **Ranking list stops at exactly 1,000 rows.** Whether that is a limit of the trial API tier is **to be verified**.
+        - **Doubles rankings only.** There is no match, result or head-to-head data, so performance is measured only through ranking points.
+        - **`parent_id` mostly does not resolve** inside the competitions response (cause **to be verified**), so the tournament
+          hierarchy cannot be rebuilt in full from this endpoint.
+        - **Tournament level is available for only about 11% of competitions**, and only for some categories, so level-based
+          comparisons cover a small share of the data.
+        - **Venue counts are raw counts**, not adjusted for country size or tour activity, and the venue data has no coordinates for map views.
+        - **The `country` field contains non-country values** such as "Neutral", which affects country-level comparisons.
+        - **Men's and women's ranking lists are combined** in the country charts.""")
+
+        st.markdown("### Future implementation: how this project can be improved")
+        st.markdown("""
+        **Better and fresher data**
+        - **Automatic scheduled refresh:** run the pipeline weekly or daily with a scheduler (Windows Task Scheduler, cron or Airflow),
+          so snapshots are consecutive and the history has no gaps.
+        - **Near-real-time data:** move from manual pulls to SportRadar's push feed (a separate product from the trial tier) so rankings
+          and results update as they change.
+        - **Full production API tier:** removes trial limits, and settles whether the 1,000-row ranking cap and the missing parent
+          competitions come from the trial.
+        - **Historical backfill:** load past ranking weeks so trend analysis works from day one.
+
+        **More data to analyse**
+        - **Singles rankings, match results, head-to-head and player profiles**, to measure performance beyond ranking points.
+        - **External benchmarks:** population, prize money, surface type and tournament calendars, for per-capita comparisons and richer insights.
+        - **Venue coordinates**, to show venues on a map.""")
+
+    with tab6:
+        st.subheader("Entity-Relationship Diagram")
+        st.graphviz_chart(r'''
+digraph ERD {
+  rankdir=LR;
+  node [shape=record, fontname="Helvetica", fontsize=10];
+  edge [fontname="Helvetica", fontsize=9];
+  Categories [label="{Categories|category_id (PK)\lcategory_name\l}"];
+  Competitions [label="{Competitions|competition_id (PK)\lcompetition_name\lparent_id (soft link)\ltype\lgender\lcategory_id (FK)\lcategory_level\l}"];
+  Complexes [label="{Complexes|complex_id (PK)\lcomplex_name\l}"];
+  Venues [label="{Venues|venue_id (PK)\lvenue_name\lcity_name\lcountry_name\lcountry_code\ltimezone\lcomplex_id (FK)\l}"];
+  Competitors [label="{Competitors|competitor_id (PK)\lname\lcountry\lcountry_code\labbreviation\l}"];
+  Competitor_Rankings [label="{Competitor_Rankings|rank_id (PK)\lrank\lmovement\lpoints\lcompetitions_played\lranking_year\lranking_week\lranking_gender\lcompetitor_id (FK)\lUNIQUE(competitor_id, year, week, gender)\l}"];
+  Competitions -> Categories [label="category_id"];
+  Competitions -> Competitions [label="parent_id (not enforced)", style=dashed];
+  Venues -> Complexes [label="complex_id"];
+  Competitor_Rankings -> Competitors [label="competitor_id"];
+}
+''')
+        st.caption("ETL_Run_Log (run_id, run_at, status, details) is a standalone audit table with no relationships.")
+
+    with tab7:
+        st.subheader("Data Dictionary")
+        dd_path = os.path.join(PROJECT_ROOT, "docs", "DATA_DICTIONARY.md")
+        if os.path.exists(dd_path):
+            with open(dd_path, "r", encoding="utf-8") as f:
+                st.markdown(f.read())
+        else:
+            st.info("docs/DATA_DICTIONARY.md not found.")
