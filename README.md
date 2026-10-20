@@ -39,6 +39,9 @@ Differences between the brief and the real API response (details in [`DECISIONS.
 
 Run `python main.py` weekly to accumulate ranking history: rankings upsert per (competitor, year, week, gender) instead of being overwritten.
 
+## Hosting
+The dashboard can be hosted free on Streamlit without a database server, from a saved snapshot file (`data/tennis.db`). See [`HOSTING.md`](HOSTING.md).
+
 ## Pipeline reliability
 - API: timeouts, retries with backoff, HTTP 429 handling, clear errors on bad JSON.
 - Transform: malformed records skipped with a logged warning; shared entities deduplicated.
